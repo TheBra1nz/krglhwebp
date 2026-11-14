@@ -7,19 +7,40 @@
 #include <webp/encode.h>
 #include <webp/decode.h>
 #include <memory>
+#include <vector>
 
 #include "tp_stub.h"
 
 #define EXPORT(hr) extern "C" __declspec(dllexport) hr __stdcall
 
-static const tjs_int WEBP_VP8_HEADER_SIZE = 30;
+// Initial probe size, not a minimum file size: lossless WebP can be smaller.
+static const tjs_int WEBP_HEADER_PROBE_SIZE = 30;
 static const tjs_int WEBP_IDECODE_BUFFER_SZ = (1 << 16);
+
+static const tjs_char *TVPReadWEBPHeader(IStream *src, std::vector<uint8_t> &data, WebPBitstreamFeatures *features)
+{
+	uint8_t input[WEBP_IDECODE_BUFFER_SZ];
+	for (;;)
+	{
+		ULONG read = 0;
+		ULONG request = data.empty() ? WEBP_HEADER_PROBE_SIZE : (ULONG)sizeof(input);
+		if (FAILED(src->Read(input, request, &read)))
+			return TJS_W("Error reading file");
+		if (read == 0)
+			return TJS_W("Not enough data in file");
+		data.insert(data.end(), input, input + read);
+		VP8StatusCode status = WebPGetFeatures(data.data(), data.size(), features);
+		if (status == VP8_STATUS_OK)
+			return NULL;
+		if (status != VP8_STATUS_NOT_ENOUGH_DATA)
+			return TJS_W("Invalid WebP image");
+	}
+}
 
 void TVPLoadWEBP(void *formatdata, void *callbackdata, tTVPGraphicSizeCallback sizecallback, tTVPGraphicScanLineCallback scanlinecallback, tTVPMetaInfoPushCallback metainfopushcallback, IStream *src, tjs_int keyidx, tTVPGraphicLoadMode mode)
 {
-	STATSTG stg;
 	const tjs_char *error;
-	tjs_int datasize;
+	std::vector<uint8_t> headerdata;
 	int width, height;
 	tjs_uint8 *line0;
 	int size_pixel;
@@ -32,41 +53,18 @@ void TVPLoadWEBP(void *formatdata, void *callbackdata, tTVPGraphicSizeCallback s
 
 	error = NULL;
 
-	src->Stat(&stg, STATFLAG_NONAME);
-	datasize = stg.cbSize.QuadPart;
-	if (datasize < WEBP_VP8_HEADER_SIZE)
-	{
-		error = TJS_W("File size is too small");
-		goto finish;
-	}
-
-	uint8_t headerdata[WEBP_VP8_HEADER_SIZE];
 	ULONG read;
-	src->Read(headerdata, WEBP_VP8_HEADER_SIZE, &read);
-	if (read != WEBP_VP8_HEADER_SIZE)
-	{
-		error = TJS_W("Read size is too small");
-		goto finish;
-	}
-
 	WebPDecoderConfig config;
 	if (WebPInitDecoderConfig(&config) == 0)
 	{
 		error = TJS_W("Error initializing decoder");
 		goto finish;
 	}
-	if (WebPGetFeatures(headerdata, WEBP_VP8_HEADER_SIZE, &config.input) != VP8_STATUS_OK)
-	{
-		error = TJS_W("Error getting features");
+	error = TVPReadWEBPHeader(src, headerdata, &config.input);
+	if (error != NULL)
 		goto finish;
-	}
-	width = 0;
-	height = 0;
-	if (WebPGetInfo(headerdata, WEBP_VP8_HEADER_SIZE, &width, &height) == 0)
-	{
-		error = TJS_W("Error getting size");
-		goto finish;
-	}
+	width = config.input.width;
+	height = config.input.height;
 	sizecallback(callbackdata, width, height);
 	// Determine the buffer pitch...
 	line0 = (tjs_uint8 *)scanlinecallback(callbackdata, 0);
@@ -138,49 +136,55 @@ void TVPLoadWEBP(void *formatdata, void *callbackdata, tTVPGraphicSizeCallback s
 	input = (tjs_uint8 *)malloc(WEBP_IDECODE_BUFFER_SZ);
 	if (NULL == input)
 	{
+		WebPIDelete(idec);
 		WebPFreeDecBuffer(&(config.output));
 		error = TJS_W("Could not allocate decode buffer");
 		goto finish;
 	}
-	status = WebPIAppend(idec, headerdata, WEBP_VP8_HEADER_SIZE);
-	do
+	// The header probe may already contain a complete tiny image.
+	status = WebPIAppend(idec, headerdata.data(), headerdata.size());
+	while (status == VP8_STATUS_SUSPENDED)
 	{
-		src->Read(input, WEBP_IDECODE_BUFFER_SZ, &read);
+		read = 0;
+		if (FAILED(src->Read(input, WEBP_IDECODE_BUFFER_SZ, &read)))
+		{
+			error = TJS_W("Error reading file");
+			break;
+		}
 		if (0 == read)
 		{
 			error = TJS_W("Not enough data in file");
 			break;
 		}
 		status = WebPIAppend(idec, input, read);
-		if (VP8_STATUS_OK != status && VP8_STATUS_SUSPENDED != status)
+	}
+	if (error == NULL && status != VP8_STATUS_OK)
+	{
+		switch(status)
 		{
-			switch(status)
-			{
-				case VP8_STATUS_OUT_OF_MEMORY:
-					error = TJS_W("Out of memory");
-					break;
-				case VP8_STATUS_INVALID_PARAM:
-					error = TJS_W("Invalid parameter");
-					break;
-				case VP8_STATUS_BITSTREAM_ERROR:
-					error = TJS_W("Bitstream error");
-					break;
-				case VP8_STATUS_UNSUPPORTED_FEATURE:
-					error = TJS_W("Unsupported feature");
-					break;
-				case VP8_STATUS_USER_ABORT:
-					error = TJS_W("User abort");
-					break;
-				case VP8_STATUS_NOT_ENOUGH_DATA:
-					error = TJS_W("Not enough data");
-					break;
-				default:
-					error = TJS_W("Unknown error");
-					break;
-			}
-			break;
+			case VP8_STATUS_OUT_OF_MEMORY:
+				error = TJS_W("Out of memory");
+				break;
+			case VP8_STATUS_INVALID_PARAM:
+				error = TJS_W("Invalid parameter");
+				break;
+			case VP8_STATUS_BITSTREAM_ERROR:
+				error = TJS_W("Bitstream error");
+				break;
+			case VP8_STATUS_UNSUPPORTED_FEATURE:
+				error = TJS_W("Unsupported feature");
+				break;
+			case VP8_STATUS_USER_ABORT:
+				error = TJS_W("User abort");
+				break;
+			case VP8_STATUS_NOT_ENOUGH_DATA:
+				error = TJS_W("Not enough data");
+				break;
+			default:
+				error = TJS_W("Unknown error");
+				break;
 		}
-	} while (VP8_STATUS_OK != status);
+	}
 	free(input);
 	WebPIDelete(idec);
 
@@ -233,33 +237,17 @@ finish:
 
 void TVPLoadHeaderWEBP(void *formatdata, IStream *src, iTJSDispatch2 **dic)
 {
-	STATSTG stg;
-
-	src->Stat(&stg, STATFLAG_NONAME);
-	if (stg.cbSize.QuadPart < WEBP_VP8_HEADER_SIZE)
-	{
-		TVPThrowExceptionMessage(TJS_W("File size is too small"));
-		return;
-	}
-
-	uint8_t data[WEBP_VP8_HEADER_SIZE];
-	ULONG read;
-	src->Read(data, WEBP_VP8_HEADER_SIZE, &read);
-	if (WEBP_VP8_HEADER_SIZE != read)
-	{
-		TVPThrowExceptionMessage(TJS_W("Read size is too small"));
-		return;
-	}
-
+	std::vector<uint8_t> data;
 	WebPDecoderConfig config;
 	if (WebPInitDecoderConfig(&config) == 0)
 	{
 		TVPThrowExceptionMessage(TJS_W("Error initializing decoder"));
 		return;
 	}
-	if (WebPGetFeatures(data, WEBP_VP8_HEADER_SIZE, &config.input) != VP8_STATUS_OK)
+	const tjs_char *error = TVPReadWEBPHeader(src, data, &config.input);
+	if (error != NULL)
 	{
-		TVPThrowExceptionMessage(TJS_W("Invalid WebP image"));
+		TVPThrowExceptionMessage(error);
 		return;
 	}
 
